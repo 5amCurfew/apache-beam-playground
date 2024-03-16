@@ -5,20 +5,21 @@ from typing import Optional
 import apache_beam as beam
 from apache_beam.options.pipeline_options import PipelineOptions
 
-# User defined functions should always be subclassed from DoFn. This function transforms
-# each element into a tuple where the first field is userId and the second is click. It
-# assigns the timestamp to the metadata of the element such that window functions can use
-# it later to group elements into windows.
-class AddTimestampDoFn(beam.DoFn):
+
+# Transform each element into a tuple where the first field is userId and assigns the timestamp to 
+# the metadata of the element such that window functions can use it later to group elements into windows.
+class TransformDoFn(beam.DoFn):
     def process(self, element):
         unix_timestamp = element["recordedAt"]
-        element = (element["userId"], {"event": element["event"], "recordedAt": element["event"]})
-
         # Each element of the pipeline is transformed into a tuple where the first field is the userId 
-        # (which will be assumed the Key in CombinePerKey)
+        # (which will be the assumed key in CombinePerKey)
+        element = (
+            element["userId"], 
+            1 if element["event"] == "click" else 0
+        )
         yield beam.transforms.window.TimestampedValue(element, unix_timestamp)
 
-class ExtractSessionID(beam.DoFn):
+class SessionSummaryDoFn(beam.DoFn):
     def process(self, aggregated_element, window=beam.DoFn.WindowParam):
         session_id = {
             "userId": aggregated_element[0],
@@ -36,17 +37,21 @@ def build_run(pipeline_options: Optional[PipelineOptions] = None, known_args: Op
             p 
             | "Create" >> beam.Create(
                 [
-                    {"userId": "Andy", "event": "click", "recordedAt": 1603112520},  # Monday, 19 October 2020 13:02:00
-                    {"userId": "Sam", "event": "click", "recordedAt": 1603113240},   # Monday, 19 October 2020 13:14:00
-                    {"userId": "Andy", "event": "click", "recordedAt": 1603113600},  # Monday, 19 October 2020 13:20:00
-                    {"userId": "Andy", "event": "click", "recordedAt": 1603115820},  # Monday, 19 October 2020 13:57:00
+                    {"userId": "Andy", "event": "click", "recordedAt": 1603112520},     # Monday, 19 October 2020 13:02:00
+                    {"userId": "Sam", "event": "click", "recordedAt": 1603113240},      # Monday, 19 October 2020 13:14:00
+                    {"userId": "Sam", "event": "screen", "recordedAt": 1603113244},     # Monday, 19 October 2020 13:14:04
+                    {"userId": "Sam", "event": "screen", "recordedAt": 1603113248},     # Monday, 19 October 2020 13:14:08
+                    {"userId": "Sam", "event": "screen", "recordedAt": 1603113249},     # Monday, 19 October 2020 13:14:09
+                    {"userId": "Andy", "event": "click", "recordedAt": 1603113600},     # Monday, 19 October 2020 13:20:00
+                    {"userId": "Andy", "event": "click", "recordedAt": 1603115820},     # Monday, 19 October 2020 13:57:00
                     {"userId": known_args.new_user, "event": "click", "recordedAt": int(datetime.datetime.now().strftime('%s'))},  # "Now"
                 ]
             )
             # Assign timestamp to metadata of elements such that Beam's window functions can
             # access and use them to group events.
-            | "AddTimestamp" >> beam.ParDo(AddTimestampDoFn())
-            | "Session Window" >> beam.WindowInto(
+            # | "Filter" >> beam.ParDo(FilterDoFn())
+            | "Transform: TimestampedValue" >> beam.ParDo(TransformDoFn())
+            | "Assign Session Window" >> beam.WindowInto(
                 # Each session must be separated by a time gap of at least 30 minutes (1800 sec)
                 beam.transforms.window.Sessions(gap_size=30 * 60), # This is a class extended from WindowFn
 
@@ -68,12 +73,14 @@ def build_run(pipeline_options: Optional[PipelineOptions] = None, known_args: Op
                 # By setting allowed_lateness we can handle late data. If allowed lateness is
                 # set, the default trigger will emit new results immediately whenever late
                 # data arrives.
-                allowed_lateness=beam.transforms.window.Duration(seconds=1 * 24 * 60 * 60),  # 1 day
+                allowed_lateness=beam.transforms.window.Duration(seconds=300),  # 5 Minutes
             )
-            | "Group By Key/Window" >> beam.combiners.Count.PerKey()
-            | "Extract Session ID" >> beam.ParDo(ExtractSessionID())
+            # | "Count By Key,Window" >> beam.combiners.Count.PerKey()    
+            | "Sum Clicks By Key,Window" >> beam.CombinePerKey(sum)
+            | "Transform: Session Summary" >> beam.ParDo(SessionSummaryDoFn())
             | "Print" >> beam.ParDo(print)
         )
+
 
 if __name__ == "__main__":
     logging.getLogger().setLevel(logging.INFO)
@@ -82,7 +89,13 @@ if __name__ == "__main__":
     parser.add_argument("--new-user", default=None, help="Parse Arguments using argparse")
     known_args, other_args = parser.parse_known_args()
 
-    pipeline_options = PipelineOptions(runner="DirectRunner", save_main_session=True, setup_file="./setup.py")
+    pipeline_options = PipelineOptions(
+        runner="DirectRunner",
+        streaming=True,
+        save_main_session=True, 
+        setup_file="./setup.py"
+    )
+
     build_run(
         pipeline_options=pipeline_options,
         known_args=known_args,
