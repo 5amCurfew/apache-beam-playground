@@ -19,6 +19,7 @@ class TransformDoFn(beam.DoFn):
         )
         yield beam.transforms.window.TimestampedValue(element, unix_timestamp)
 
+# Pluck Session information from the metadata of the element
 class SessionSummaryDoFn(beam.DoFn):
     def process(self, aggregated_element, window=beam.DoFn.WindowParam):
         session_id = {
